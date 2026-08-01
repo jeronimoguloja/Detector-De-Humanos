@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from hand_mouse import HandMouseController, draw_hand_marker
+from hand_mouse import HandMouseController, HandMouseState, draw_hand_marker
 from motion_tracker import MotionTracker
 from pose_detector import (
     LIMB_GROUPS,
@@ -52,8 +52,17 @@ from pose_detector import (
 CAPTURE_WIDTH = 640
 CAPTURE_HEIGHT = 480
 
-# Complejidad del modelo de pose: 0 = más FPS, 1 = equilibrado, 2 = más preciso.
-MODEL_COMPLEXITY = 1
+# FPS solicitados a la cámara. El tope real depende del hardware: muchas
+# webcams solo entregan 60 fps con el códec MJPG (ver run del worker).
+TARGET_FPS = 60
+
+# Complejidad del modelo de pose: 0 = lite (necesario para acercarse a
+# 60 fps en CPU), 1 = equilibrado, 2 = más preciso pero lento.
+MODEL_COMPLEXITY = 0
+
+# El reconocedor de gestos corre 1 de cada N frames cuando está activo:
+# los gestos cambian lento y así su costo por frame se reduce a la mitad.
+GESTURE_FRAME_STRIDE = 2
 
 # Cuántos índices de cámara se prueban al buscar dispositivos.
 MAX_CAMERAS_TO_PROBE = 5
@@ -150,9 +159,13 @@ class VideoWorker(QThread):
         if not cap.isOpened():
             self.failed.emit(f"No se pudo abrir la cámara {self._camera_index}.")
             return
+        # MJPG desbloquea 60 fps en la mayoría de webcams (el formato crudo
+        # YUY2 suele limitarse a 30 fps por ancho de banda USB).
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # procesar siempre el frame más reciente
 
         try:
             detector = MediaPipePoseDetector(model_complexity=MODEL_COMPLEXITY)
@@ -166,6 +179,8 @@ class VideoWorker(QThread):
         no_limbs = dict.fromkeys(LIMB_GROUPS, False)
         fps = 0.0
         last_time = time.monotonic()
+        frame_index = 0
+        last_hand_state = HandMouseState()
 
         try:
             while not self.isInterruptionRequested():
@@ -187,9 +202,15 @@ class VideoWorker(QThread):
                 now = time.monotonic()
 
                 # 3) Manos/mouse sobre el frame espejado LIMPIO (antes de
-                #    dibujar overlays que taparian la mano).
-                hand_mouse.enabled = self._mouse_enabled
-                hand_state = hand_mouse.update(frame, now)
+                #    dibujar overlays que taparian la mano). Si el control
+                #    está desactivado NO se ejecuta el modelo de gestos:
+                #    cero costo de CPU. Activo, corre 1 de cada N frames.
+                if self._mouse_enabled:
+                    if frame_index % GESTURE_FRAME_STRIDE == 0:
+                        last_hand_state = hand_mouse.update(frame, now)
+                else:
+                    last_hand_state = HandMouseState()
+                hand_state = last_hand_state
 
                 if result is not None:
                     result = result.flip_horizontal()
@@ -218,6 +239,7 @@ class VideoWorker(QThread):
                     "hand": hand_state,
                 }
                 self.frame_ready.emit(frame, meta)
+                frame_index += 1
         finally:
             cap.release()
             detector.close()
@@ -274,10 +296,11 @@ class MainWindow(QMainWindow):
         panel.addWidget(self.start_button)
 
         self.mouse_checkbox = QCheckBox("Controlar mouse con la mano")
-        self.mouse_checkbox.setChecked(True)
+        self.mouse_checkbox.setChecked(False)  # opt-in: apagado por defecto
         self.mouse_checkbox.setToolTip(
             "El cursor sigue tu muñeca; cerrar el puño hace click izquierdo.\n"
-            "Baja la mano para liberar el cursor."
+            "Baja la mano para liberar el cursor.\n"
+            "Desactivado no consume CPU extra."
         )
         self.mouse_checkbox.toggled.connect(self._on_mouse_toggle)
         panel.addWidget(self.mouse_checkbox)
@@ -405,7 +428,9 @@ class MainWindow(QMainWindow):
             pixmap.scaled(
                 self.video_label.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                # FastTransformation: escalar 60 frames/s con filtro suave
+                # gastaría CPU que preferimos dar a los modelos.
+                Qt.TransformationMode.FastTransformation,
             )
         )
 
@@ -413,7 +438,9 @@ class MainWindow(QMainWindow):
         self.direction_label.setText(meta["motion"].label)
 
         hand = meta["hand"]
-        if hand.active:
+        if not self.mouse_checkbox.isChecked():
+            self.hand_label.setText("Desactivado")
+        elif hand.active:
             text = f"{hand.hand_label}: {hand.gesture}"
             if hand.clicked:
                 text += " — ¡CLICK!"

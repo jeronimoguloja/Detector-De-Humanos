@@ -16,6 +16,10 @@ desde una interfaz gráfica.
 - Indicadores por extremidad: cabeza, hombros, brazos, torso y piernas.
 - FPS del pipeline en tiempo real.
 - Selección de cámara (si hay varias) e inicio/paro desde la GUI.
+- Recuadro verde fino alrededor de la persona detectada.
+- **Opcional** (apagado por defecto): control del mouse con la mano más
+  visible — el cursor sigue tu muñeca y cerrar el puño hace click
+  izquierdo (permite cerrar la app con la mano).
 
 ## Requisitos
 
@@ -57,6 +61,7 @@ python main.py
 | `gui.py`            | Ventana principal (PySide6) + `VideoWorker` (QThread de captura).    |
 | `pose_detector.py`  | Abstracción del modelo de pose + implementación MediaPipe + dibujo.  |
 | `motion_tracker.py` | Cálculo de dirección/velocidad de movimiento entre frames.           |
+| `hand_mouse.py`     | Control opcional del mouse por gestos de mano (puño = click).        |
 | `requirements.txt`  | Dependencias.                                                        |
 
 ## Cómo se calcula la dirección de movimiento
@@ -90,9 +95,12 @@ La GUI no conoce MediaPipe: solo usa los contratos `BasePoseDetector` y
 
 ## Rendimiento
 
-- La cámara se captura a 640x480, el mejor equilibrio precisión/FPS en CPU.
-- Si el FPS es bajo, cambia `MODEL_COMPLEXITY = 0` en `gui.py`
-  (modelo "lite": más rápido, algo menos preciso).
+- La cámara se captura a 640x480 con códec MJPG solicitando 60 fps; el
+  tope real depende de tu webcam (muchas integradas solo llegan a 30).
+- El modelo de pose por defecto es el "lite" (`MODEL_COMPLEXITY = 0` en
+  `gui.py`); sube a `1` si prefieres más precisión a costa de FPS.
+- El control de mouse con la mano consume CPU extra solo cuando su
+  casilla está activada (y corre 1 de cada 2 frames para abaratarlo).
 
 ## Solución de problemas
 
