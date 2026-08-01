@@ -3,6 +3,9 @@
 venv/
 env/
 
+# Modelos descargados de MediaPipe (se bajan solos en el primer arranque)
+models/
+
 # Caché de Python
 __pycache__/
 *.py[cod]

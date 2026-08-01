@@ -19,8 +19,8 @@ desde una interfaz gráfica.
 
 ## Requisitos
 
-- **Python 3.10 – 3.12** (recomendado 3.11; verifica que exista una
-  rueda de `mediapipe` para tu versión exacta de Python).
+- **Python 3.10 – 3.13** (verifica que exista una rueda de `mediapipe`
+  para tu versión exacta de Python: `pip index versions mediapipe`).
 - Una cámara web.
 - No se necesita GPU.
 
@@ -28,7 +28,7 @@ desde una interfaz gráfica.
 
 ```powershell
 cd "d:\UDEM\Modelos IA\Detector de humanos"
-py -3.11 -m venv .venv
+python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
@@ -98,7 +98,7 @@ La GUI no conoce MediaPipe: solo usa los contratos `BasePoseDetector` y
 
 | Problema | Solución |
 | -------- | -------- |
-| `pip` no encuentra `mediapipe` | Tu versión de Python no tiene rueda publicada; usa Python 3.11 o 3.12. |
+| `pip` no encuentra `mediapipe` | Tu versión de Python no tiene rueda publicada; usa una versión de Python con soporte (3.10–3.13). |
 | "No se pudo abrir la cámara" | Cierra otras apps que usen la cámara (Teams, Zoom, navegador) y pulsa **Buscar**. |
 | `ImportError: DLL load failed` al cargar mediapipe | Instala el paquete "Microsoft Visual C++ Redistributable" más reciente. |
 | El video va lento | Usa `MODEL_COMPLEXITY = 0` en `gui.py` y cierra aplicaciones pesadas. |

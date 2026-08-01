@@ -23,8 +23,9 @@ import time
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -37,8 +38,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from hand_mouse import HandMouseController, draw_hand_marker
 from motion_tracker import MotionTracker
-from pose_detector import LIMB_GROUPS, MediaPipePoseDetector, draw_skeleton
+from pose_detector import (
+    LIMB_GROUPS,
+    MediaPipePoseDetector,
+    draw_bounding_box,
+    draw_skeleton,
+)
 
 # Resolución solicitada a la cámara: 640x480 es el mejor equilibrio
 # precisión/FPS para MediaPipe corriendo en CPU.
@@ -122,9 +129,21 @@ class VideoWorker(QThread):
     # error irrecuperable (cámara inexistente, desconexión, fallo del modelo)
     failed = Signal(str)
 
-    def __init__(self, camera_index: int, parent=None) -> None:
+    def __init__(
+        self,
+        camera_index: int,
+        screen_size: tuple[int, int],
+        mouse_enabled: bool = True,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._camera_index = camera_index
+        self._screen_size = screen_size
+        self._mouse_enabled = mouse_enabled
+
+    def set_mouse_enabled(self, enabled: bool) -> None:
+        # bool atómico (GIL): seguro de escribir desde el hilo de la GUI.
+        self._mouse_enabled = enabled
 
     def run(self) -> None:  # se ejecuta en el hilo secundario
         cap = cv2.VideoCapture(self._camera_index, preferred_backend())
@@ -137,9 +156,10 @@ class VideoWorker(QThread):
 
         try:
             detector = MediaPipePoseDetector(model_complexity=MODEL_COMPLEXITY)
-        except Exception as exc:  # p. ej. mediapipe no instalado / DLL faltante
+            hand_mouse = HandMouseController(self._screen_size)
+        except Exception as exc:  # p. ej. falta descargar un modelo sin internet
             cap.release()
-            self.failed.emit(f"No se pudo inicializar el modelo de pose:\n{exc}")
+            self.failed.emit(f"No se pudo inicializar el modelo:\n{exc}")
             return
 
         tracker = MotionTracker()
@@ -165,14 +185,22 @@ class VideoWorker(QThread):
                 #    la dirección de movimiento coincidan con la pantalla.
                 frame = cv2.flip(frame, 1)
                 now = time.monotonic()
+
+                # 3) Manos/mouse sobre el frame espejado LIMPIO (antes de
+                #    dibujar overlays que taparian la mano).
+                hand_mouse.enabled = self._mouse_enabled
+                hand_state = hand_mouse.update(frame, now)
+
                 if result is not None:
                     result = result.flip_horizontal()
                     draw_skeleton(frame, result)
+                    draw_bounding_box(frame, result)
                     motion = tracker.update(result.center_point(), now)
                     limbs = result.limb_status()
                 else:
                     motion = tracker.update(None, now)
                     limbs = no_limbs
+                draw_hand_marker(frame, hand_state)
 
                 # 3) FPS reales del pipeline (captura + inferencia + dibujo),
                 #    suavizados con EMA para que no parpadeen.
@@ -187,11 +215,13 @@ class VideoWorker(QThread):
                     "motion": motion,
                     "limbs": limbs,
                     "person": result is not None,
+                    "hand": hand_state,
                 }
                 self.frame_ready.emit(frame, meta)
         finally:
             cap.release()
             detector.close()
+            hand_mouse.close()
 
 
 class MainWindow(QMainWindow):
@@ -243,6 +273,15 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self._toggle_detection)
         panel.addWidget(self.start_button)
 
+        self.mouse_checkbox = QCheckBox("Controlar mouse con la mano")
+        self.mouse_checkbox.setChecked(True)
+        self.mouse_checkbox.setToolTip(
+            "El cursor sigue tu muñeca; cerrar el puño hace click izquierdo.\n"
+            "Baja la mano para liberar el cursor."
+        )
+        self.mouse_checkbox.toggled.connect(self._on_mouse_toggle)
+        panel.addWidget(self.mouse_checkbox)
+
         panel.addWidget(self._separator())
 
         panel.addWidget(self._section_title("Rendimiento"))
@@ -255,6 +294,10 @@ class MainWindow(QMainWindow):
         self.direction_label.setObjectName("directionLabel")
         self.direction_label.setWordWrap(True)
         panel.addWidget(self.direction_label)
+
+        panel.addWidget(self._section_title("Control por mano"))
+        self.hand_label = QLabel("Sin mano")
+        panel.addWidget(self.hand_label)
 
         panel.addWidget(self._section_title("Extremidades detectadas"))
         for limb_name in LIMB_GROUPS:
@@ -316,7 +359,17 @@ class MainWindow(QMainWindow):
         camera_index = self.camera_combo.currentData()
         if camera_index is None or camera_index < 0:
             return
-        self._worker = VideoWorker(camera_index)
+        # pynput trabaja en píxeles físicos; Qt reporta lógicos, se corrige
+        # con el factor de escala (DPI) del monitor principal.
+        screen = QGuiApplication.primaryScreen()
+        ratio = screen.devicePixelRatio()
+        screen_size = (
+            int(screen.geometry().width() * ratio),
+            int(screen.geometry().height() * ratio),
+        )
+        self._worker = VideoWorker(
+            camera_index, screen_size, self.mouse_checkbox.isChecked()
+        )
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.failed.connect(self._on_failed)
         self._worker.finished.connect(self._on_worker_finished)
@@ -358,10 +411,25 @@ class MainWindow(QMainWindow):
 
         self.fps_label.setText(f"{meta['fps']:.1f} FPS")
         self.direction_label.setText(meta["motion"].label)
+
+        hand = meta["hand"]
+        if hand.active:
+            text = f"{hand.hand_label}: {hand.gesture}"
+            if hand.clicked:
+                text += " — ¡CLICK!"
+            self.hand_label.setText(text)
+        else:
+            self.hand_label.setText("Sin mano")
+
         for limb_name, detected in meta["limbs"].items():
             label = self._limb_labels.get(limb_name)
             if label is not None:
                 self._set_limb_state(label, detected)
+
+    @Slot(bool)
+    def _on_mouse_toggle(self, checked: bool) -> None:
+        if self._worker is not None:
+            self._worker.set_mouse_enabled(checked)
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
@@ -378,6 +446,7 @@ class MainWindow(QMainWindow):
         self.video_label.setText("Cámara detenida")
         self.fps_label.setText("0.0 FPS")
         self.direction_label.setText("—")
+        self.hand_label.setText("Sin mano")
         for label in self._limb_labels.values():
             self._set_limb_state(label, detected=False)
 

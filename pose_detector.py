@@ -16,8 +16,11 @@ la interfaz gráfica ni el rastreador de movimiento.
 
 from __future__ import annotations
 
+import time
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -115,6 +118,20 @@ class PoseResult:
             return float(nose[0]), float(nose[1])
         return None
 
+    def bounding_box(
+        self, threshold: float = VISIBILITY_THRESHOLD, margin: float = 0.06
+    ) -> tuple[float, float, float, float] | None:
+        """Caja normalizada (x0, y0, x1, y1) que engloba los landmarks visibles."""
+        visible = self.landmarks[self.landmarks[:, 3] >= threshold]
+        if len(visible) < 2:
+            return None
+        return (
+            max(0.0, float(visible[:, 0].min()) - margin),
+            max(0.0, float(visible[:, 1].min()) - margin),
+            min(1.0, float(visible[:, 0].max()) + margin),
+            min(1.0, float(visible[:, 1].max()) + margin),
+        )
+
 
 class BasePoseDetector(ABC):
     """Contrato mínimo que debe cumplir cualquier detector de pose."""
@@ -127,8 +144,45 @@ class BasePoseDetector(ABC):
         """Libera los recursos del modelo (opcional)."""
 
 
+# Modelos oficiales de PoseLandmarker por nivel de complejidad.
+# Se descargan una sola vez a la carpeta local models/.
+_MODEL_URLS = {
+    0: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    1: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+    2: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+}
+
+
+def download_model(url: str) -> str:
+    """Descarga un modelo .task a la carpeta local models/ si aún no existe.
+
+    También la usa hand_mouse.py para el reconocedor de gestos de mano.
+    """
+    models_dir = Path(__file__).resolve().parent / "models"
+    models_dir.mkdir(exist_ok=True)
+    model_path = models_dir / url.rsplit("/", 1)[-1]
+    if not model_path.exists():
+        try:
+            urllib.request.urlretrieve(url, model_path)
+        except Exception as exc:
+            model_path.unlink(missing_ok=True)  # no dejar descargas a medias
+            raise RuntimeError(
+                "No se pudo descargar el modelo (se necesita internet "
+                f"solo la primera vez): {exc}"
+            ) from exc
+    return str(model_path)
+
+
+def _ensure_model(model_complexity: int) -> str:
+    return download_model(_MODEL_URLS[model_complexity])
+
+
 class MediaPipePoseDetector(BasePoseDetector):
-    """Detector basado en MediaPipe Pose (BlazePose, 33 landmarks).
+    """Detector basado en MediaPipe Tasks PoseLandmarker (BlazePose, 33 landmarks).
+
+    Nota: mediapipe >= 0.10.30 eliminó la antigua API ``mp.solutions``;
+    esta implementación usa la API de Tasks, que requiere un archivo de
+    modelo .task (se descarga automáticamente la primera vez).
 
     ``model_complexity``: 0 = lite (máximo FPS), 1 = full (equilibrado),
     2 = heavy (más preciso pero lento en CPU).
@@ -144,30 +198,47 @@ class MediaPipePoseDetector(BasePoseDetector):
         # solo se importa al crear el detector (dentro del hilo de video),
         # evitando congelar la GUI al arrancar la aplicación.
         import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python import vision
 
-        self._pose = mp.solutions.pose.Pose(
-            static_image_mode=False,  # modo video: reutiliza tracking entre frames
-            model_complexity=model_complexity,
-            enable_segmentation=False,  # no se necesita la máscara de segmentación
-            min_detection_confidence=min_detection_confidence,
+        self._mp = mp
+        options = vision.PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=_ensure_model(model_complexity)),
+            running_mode=vision.RunningMode.VIDEO,  # modo video: usa tracking entre frames
+            num_poses=1,  # una sola persona: más rápido y suficiente para esta app
+            min_pose_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
+        self._landmarker = vision.PoseLandmarker.create_from_options(options)
+        # El modo VIDEO exige timestamps en ms estrictamente crecientes.
+        self._start_time = time.monotonic()
+        self._last_timestamp_ms = -1
 
     def process(self, frame_bgr: np.ndarray) -> PoseResult | None:
         # MediaPipe espera RGB; OpenCV entrega BGR.
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False  # permite a MediaPipe procesar sin copiar
-        output = self._pose.process(rgb)
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+
+        timestamp_ms = int((time.monotonic() - self._start_time) * 1000)
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+
+        output = self._landmarker.detect_for_video(mp_image, timestamp_ms)
         if not output.pose_landmarks:
             return None
+        person = output.pose_landmarks[0]  # num_poses=1: solo hay una lista
         data = np.array(
-            [[lm.x, lm.y, lm.z, lm.visibility] for lm in output.pose_landmarks.landmark],
+            [
+                [lm.x, lm.y, lm.z, 1.0 if lm.visibility is None else lm.visibility]
+                for lm in person
+            ],
             dtype=np.float32,
         )
         return PoseResult(data)
 
     def close(self) -> None:
-        self._pose.close()
+        self._landmarker.close()
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +280,22 @@ def draw_skeleton(
             center = tuple(pixels[idx])
             cv2.circle(frame_bgr, center, 5, _JOINT_RING, -1, cv2.LINE_AA)
             cv2.circle(frame_bgr, center, 3, _JOINT_FILL, -1, cv2.LINE_AA)
+
+
+_BOX_COLOR = (0, 210, 90)  # verde (BGR)
+
+
+def draw_bounding_box(
+    frame_bgr: np.ndarray,
+    result: PoseResult,
+    threshold: float = VISIBILITY_THRESHOLD,
+) -> None:
+    """Rectángulo verde fino alrededor de la persona detectada."""
+    box = result.bounding_box(threshold)
+    if box is None:
+        return
+    height, width = frame_bgr.shape[:2]
+    top_left = (int(box[0] * width), int(box[1] * height))
+    bottom_right = (int(box[2] * width), int(box[3] * height))
+    # Grosor 1: visible pero discreto, no tapa la imagen.
+    cv2.rectangle(frame_bgr, top_left, bottom_right, _BOX_COLOR, 1, cv2.LINE_AA)
