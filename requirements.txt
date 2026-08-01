@@ -1,0 +1,14 @@
+# --- Detección de pose (corre en CPU, sin necesidad de GPU) ---
+mediapipe>=0.10.14
+
+# --- Captura de cámara y dibujo del overlay ---
+# Se usa la variante "contrib" porque mediapipe ya depende de ella;
+# instalar opencv-python + opencv-contrib-python a la vez provoca
+# conflictos (dos paquetes que proveen el mismo módulo cv2).
+opencv-contrib-python>=4.9.0
+
+# --- Interfaz gráfica (Qt 6) ---
+PySide6>=6.6
+
+# --- Cálculos numéricos (suavizado, velocidad, dirección) ---
+numpy>=1.26
